@@ -2,6 +2,10 @@ from pathlib import Path
 from datetime import datetime, timezone, timedelta
 import base64
 import json
+import io
+import re
+import zipfile
+from decimal import Decimal, ROUND_HALF_UP
 
 import streamlit as st
 import streamlit.components.v1 as components
@@ -9,6 +13,9 @@ import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 
+import kepco_collect
+import kepco_hwp
+import kepco_images
 from data_services import (
     fetch_keywords,
     fetch_headlines,
@@ -27,6 +34,7 @@ st.set_page_config(
 
 BASE_DIR = Path(__file__).resolve().parent
 KST = timezone(timedelta(hours=9))
+WEEKDAYS = "월화수목금토일"
 
 HTML_CANDIDATES = [
     BASE_DIR / "briefing.html",
@@ -44,6 +52,10 @@ HTML_PATH = next(
 
 LOGO_PATH = BASE_DIR / "ai_curator_logo.png"
 
+# 한국전력공사 자동보고서 프로그램(Windows용) 압축 파일
+KEPCO_ZIP_PATH = BASE_DIR / "KepcoReport_v6.zip"
+KEPCO_GUIDE_NAME = "KepcoReport_v6/사용방법.txt"
+
 if "page" not in st.session_state:
     st.session_state.page = "home"
 
@@ -52,6 +64,12 @@ if "eff_subtab" not in st.session_state:
 
 if "sum_subtab" not in st.session_state:
     st.session_state.sum_subtab = "mss"
+
+
+def today_title():
+    """오늘 날짜 제목: '26. 11. 13(금)"""
+    now = datetime.now(KST)
+    return f"'{now:%y}. {now.month}. {now.day}({WEEKDAYS[now.weekday()]})"
 
 
 # ==================================================
@@ -101,22 +119,34 @@ def read_text_file(path):
         )
 
 
+def read_kepco_guide():
+    """압축 파일 안의 사용방법.txt를 읽어 화면에 보여 주기 위한 함수"""
+    try:
+        with zipfile.ZipFile(KEPCO_ZIP_PATH) as zf:
+            return zf.read(KEPCO_GUIDE_NAME).decode("utf-8-sig")
+    except Exception:
+        return None
+
+
 def extract_article_summary(url):
     """URL에 직접 접근하여 기사 본문 또는 공개 설명문을 발췌하는 함수"""
     if not url or not str(url).startswith("http"):
-        return None  
-    
+        return None
+
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
-    
+
     try:
         response = requests.get(url, headers=headers, timeout=5)
         if response.status_code != 200:
             return f"[요약 불가] 페이지 접근 실패 (HTTP 상태 코드: {response.status_code})"
-        
+
+        # 인코딩이 헤더에 없는 언론사 한글 깨짐 방지
+        response.encoding = response.apparent_encoding
+
         soup = BeautifulSoup(response.text, 'html.parser')
-        
+
         for script in soup.find_all('script', type='application/ld+json'):
             try:
                 data = json.loads(script.string)
@@ -125,24 +155,136 @@ def extract_article_summary(url):
                     return body[:300] + "..." if len(body) > 300 else body
             except Exception:
                 pass
-                
-        article_tags = soup.find_all(['article', 'div'], class_names=['article_body', 'news_body', 'article-view', 'content'])
+
+        article_tags = soup.find_all(
+            ['article', 'div'],
+            class_=['article_body', 'news_body', 'article-view', 'content'],
+        )
         for tag in article_tags:
             text = tag.get_text(strip=True)
             if len(text) > 50:
                 return text[:300] + "..." if len(text) > 300 else text
-                
+
         meta_desc = soup.find('meta', property='og:description') or soup.find('meta', attrs={'name': 'description'})
         if meta_desc and meta_desc.get('content'):
             desc = meta_desc.get('content').strip()
             return f"[설명문 발췌] {desc}"
-            
+
         return "[요약 불가] 본문 영역을 추출할 수 없습니다 (유료/로그인/차단 페이지 가능성)."
-        
+
     except requests.exceptions.Timeout:
         return "[요약 불가] 페이지 요청 시간 초과 (Timeout)"
     except Exception as e:
         return f"[요약 불가] 오류 발생: {str(e)}"
+
+
+
+# ---------- 한국전력공사 자동보고서 (한글 파일 생성) ----------
+KEPCO_TEMPLATE_NAME = "KepcoReport_v6/template.hwp"
+DIR_LABELS = {"up": "▲ 상승", "down": "▼ 하락", "flat": "- 보합"}
+DIR_KEYS = list(DIR_LABELS.keys())
+NUM_RE = re.compile(r"^\d[\d,]*(?:\.\d+)?$")
+
+
+def load_kepco_template():
+    if KEPCO_ZIP_PATH.is_file():
+        with zipfile.ZipFile(KEPCO_ZIP_PATH) as zf:
+            return zf.read(KEPCO_TEMPLATE_NAME)
+    alt = BASE_DIR / "template.hwp"
+    if alt.is_file():
+        return alt.read_bytes()
+    raise FileNotFoundError("KepcoReport_v6.zip(또는 template.hwp)를 찾을 수 없습니다.")
+
+
+def kepco_collect_cb():
+    """[자동 수집] 버튼: 값을 모아 입력칸에 채운다."""
+    data = kepco_collect.collect_all()
+    status = {}
+    for key in ("domestic", "us", "fx", "kospi", "kosdaq"):
+        v = data[key]
+        ok = v.get("ok")
+        status[key] = "" if ok else v.get("reason", "수집 실패")
+        st.session_state[f"kp_{key}_price"] = v.get("priceText", "") if ok else ""
+        st.session_state[f"kp_{key}_change"] = v.get("changeText", "") if ok else ""
+        st.session_state[f"kp_{key}_ratio"] = v.get("ratioText", "") if ok else ""
+        st.session_state[f"kp_{key}_dir"] = v.get("direction", "flat") if ok else "flat"
+    for key in ("smp", "dubai"):
+        v = data[key]
+        ok = v.get("ok")
+        status[key] = "" if ok else v.get("reason", "수집 실패")
+        st.session_state[f"kp_{key}_price"] = v.get("priceText", "") if ok else ""
+        st.session_state[f"kp_{key}_date"] = v.get("sourceDate", "") if ok else ""
+    st.session_state.kp_status = status
+    st.session_state.kp_collected_at = datetime.now(KST).strftime("%H:%M:%S")
+    st.session_state.pop("kp_result", None)
+
+
+def _kp_num(label, text, errors, allow_empty=False):
+    t = str(text or "").strip().replace("▲", "").replace("▼", "").lstrip("+-").strip()
+    if not t and allow_empty:
+        return ""
+    if not NUM_RE.match(t):
+        errors.append(f"{label}: 숫자를 확인해 주세요 ('{text}')")
+        return None
+    return t
+
+
+def _kp_price2(label, text, errors):
+    t = _kp_num(label, text, errors)
+    if t is None:
+        return None
+    d = Decimal(t.replace(",", ""))
+    return {"price": float(d), "priceText": format(d.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP), "f")}
+
+
+def kepco_generate():
+    """입력칸의 값으로 한글 파일을 만들어 session_state에 저장한다."""
+    ss = st.session_state
+    errors = []
+    names = {"domestic": "한국전력(국내)", "us": "한국전력(미국)", "fx": "원/달러 환율"}
+    finance = {}
+    for key, name in names.items():
+        price = _kp_num(name + " 가격", ss.get(f"kp_{key}_price"), errors)
+        change = _kp_num(name + " 등락", ss.get(f"kp_{key}_change"), errors)
+        finance[key] = {"key": key, "priceText": price, "changeText": change,
+                        "direction": ss.get(f"kp_{key}_dir", "flat")}
+    energy = {}
+    for key, name in (("smp", "SMP"), ("dubai", "두바이유")):
+        energy[key] = _kp_price2(name + " 가격", ss.get(f"kp_{key}_price"), errors)
+    idx = {}
+    for key, name in (("kospi", "코스피"), ("kosdaq", "코스닥")):
+        price = _kp_num(name + " 지수", ss.get(f"kp_{key}_price"), errors)
+        change = _kp_num(name + " 등락", ss.get(f"kp_{key}_change"), errors)
+        ratio = _kp_num(name + " 등락률", ss.get(f"kp_{key}_ratio"), errors)
+        idx[key] = {"priceText": price, "changeText": change, "ratioText": ratio,
+                    "direction": ss.get(f"kp_{key}_dir", "flat")}
+    if errors:
+        ss.kp_result = {"errors": errors}
+        return
+
+    now = datetime.now(KST)
+    kospi_img = kepco_images.render_kospi(idx["kospi"])
+    kosdaq_img = kepco_images.render_kosdaq(idx["kosdaq"])
+    template = load_kepco_template()
+    hwp = kepco_hwp.fill_template(
+        template, finance, energy,
+        kepco_hwp.to_bmp(kospi_img, 254, 70), kepco_hwp.to_bmp(kosdaq_img, 218, 66),
+        now.replace(tzinfo=None))
+
+    def b64(im):
+        buf = io.BytesIO()
+        im.save(buf, format="PNG")
+        return base64.b64encode(buf.getvalue()).decode("ascii")
+
+    preview = kepco_hwp.preview_html(finance, energy, now.replace(tzinfo=None),
+                                     b64(kospi_img), b64(kosdaq_img))
+    ss.kp_result = {
+        "errors": [],
+        "hwp": hwp,
+        "name": "한전_주가지수_%s.hwp" % now.strftime("%Y%m%d_%H%M%S"),
+        "preview": preview,
+        "texts": kepco_hwp.paragraph_texts(hwp),
+    }
 
 
 # ==================================================
@@ -425,8 +567,23 @@ footer {{
 
 .sub-page-container h2,
 .sub-page-container p,
+.sub-page-container li,
 .sub-page-container label {{
     color: #ffffff !important;
+}}
+
+.sub-page-container ol {{
+    line-height: 1.9;
+    margin: 12px 0 0;
+    padding-left: 22px;
+}}
+
+.sub-page-container .notice {{
+    margin-top: 16px;
+    padding: 12px 16px;
+    border-radius: 10px;
+    background: rgba(155,231,255,.12);
+    border: 1px solid rgba(155,231,255,.4);
 }}
 
 .stTextArea textarea {{
@@ -493,6 +650,39 @@ footer {{
 
 .st-key-open_final_editor button:hover {{
     background: #10396f !important;
+}}
+
+.st-key-kepco_form {{
+    max-width: 1100px;
+    margin: 0 auto 30px;
+    padding: 24px 32px;
+    background: rgba(255,255,255,.06);
+    border: 1px solid rgba(255,255,255,.12);
+    border-radius: 16px;
+}}
+
+.st-key-kepco_form label,
+.st-key-kepco_form p,
+.st-key-kepco_form span,
+.st-key-kepco_form h3 {{
+    color: #ffffff !important;
+}}
+
+.st-key-kepco_form input {{
+    color: #0d1c59 !important;
+    background: #ffffff !important;
+    font-weight: 600 !important;
+}}
+
+.st-key-kepco_result {{
+    max-width: 1100px;
+    margin: 0 auto 60px;
+    padding: 0 8px;
+}}
+
+.st-key-kepco_result p,
+.st-key-kepco_result span {{
+    color: #ffffff;
 }}
 
 .editor-file-error {{
@@ -827,7 +1017,7 @@ elif st.session_state.page == "editor":
 
 
 # ==================================================
-# 8. 효율화 (1. 모니터링 탭 포함)
+# 8. 효율화
 # ==================================================
 elif st.session_state.page == "efficiency":
     with st.container(key="editor_page_container"):
@@ -873,6 +1063,7 @@ elif st.session_state.page == "efficiency":
 
         current_sub = st.session_state.get("eff_subtab", "monitoring")
 
+        # ---------- 1. 모니터링 ----------
         if current_sub == "monitoring":
             st.markdown(
                 """
@@ -897,7 +1088,7 @@ elif st.session_state.page == "efficiency":
                         excel_file = pd.ExcelFile(uploaded_article_file)
                         sheet_names = excel_file.sheet_names
                         df_articles = pd.read_excel(uploaded_article_file, sheet_name=sheet_names[0])
-                        
+
                         st.success(f"엑셀 파일 로드 성공! (총 {len(df_articles)}행 감지)")
 
                         with st.expander("업로드된 엑셀 데이터 미리보기"):
@@ -905,15 +1096,15 @@ elif st.session_state.page == "efficiency":
 
                         if st.button("🚀 유효 기사 발췌 및 요약 수행", key="run_article_scraping", type="primary"):
                             with st.spinner("언론사 페이지에 접속하여 유효 기사 본문 발췌 중..."):
-                                
+
                                 report_lines = []
-                                report_lines.append("< '26. 11. 9(월), 조간 주요 보도 발췌 >\n\n")
+                                report_lines.append(f"< {today_title()}, 조간 주요 보도 발췌 >\n\n")
                                 report_lines.append("■ 기사 발췌 결과\n\n")
 
                                 url_col = None
                                 title_col = None
                                 press_col = None
-                                
+
                                 for col in df_articles.columns:
                                     col_lower = str(col).lower()
                                     if 'url' in col_lower or '링크' in col_lower:
@@ -933,12 +1124,12 @@ elif st.session_state.page == "efficiency":
                                 success_count = 0
                                 for idx, row in df_articles.iterrows():
                                     url = str(row[url_col]) if url_col and pd.notna(row[url_col]) else ""
-                                    
+
                                     if not url or not url.startswith("http"):
                                         continue
-                                        
+
                                     extracted_text = extract_article_summary(url)
-                                    if extracted_text and "[요약 불가] URL이 존재하지 않습니다" not in extracted_text:
+                                    if extracted_text:
                                         title = str(row[title_col]) if title_col and pd.notna(row[title_col]) else f"기사 {idx+1}"
                                         press = str(row[press_col]) if press_col and pd.notna(row[press_col]) else "언론사"
 
@@ -963,16 +1154,113 @@ elif st.session_state.page == "efficiency":
                     except Exception as exc:
                         st.error(f"엑셀 파일을 처리하는 도중 오류가 발생했습니다: {exc}")
 
+        # ---------- 2. 한국전력공사 ----------
         elif current_sub == "kepco":
             st.markdown(
                 """
                 <div class="sub-page-container">
-                    <h2>⚡ 2. 한국전력공사 목차</h2>
-                    <p>한국전력공사 맞춤형 뉴스 브리핑 및 문서 목차 생성 공간입니다.</p>
+                    <h2>⚡ 2. 한국전력공사 자동보고서</h2>
+                    <p>한전 주가·환율, 코스피·코스닥, SMP(육지), 두바이유 선물 값을 모아
+                    한글(.hwp) 보고서 양식에 채우고, 화면에서 확인한 뒤 한글 파일로 내려받습니다.</p>
+                    <ol>
+                        <li><b>① 자동 수집</b>을 누르면 값이 아래 칸에 채워집니다.</li>
+                        <li>비어 있거나 틀린 칸은 직접 고칠 수 있습니다.</li>
+                        <li><b>② 한글 보고서 만들기</b>를 누르면 미리보기와 다운로드 버튼이 나옵니다.</li>
+                    </ol>
                 </div>
                 """,
                 unsafe_allow_html=True,
             )
+
+            ss = st.session_state
+            labels = {
+                "domestic": "한국전력 (국내, 원)",
+                "us": "한국전력 (미국 NYSE, USD · 등락은 %)",
+                "fx": "원/달러 환율 (원)",
+            }
+            status = ss.get("kp_status", {})
+
+            with st.container(key="kepco_form"):
+                st.button("① 자동 수집", key="kp_collect", type="primary",
+                          on_click=kepco_collect_cb)
+                if ss.get("kp_collected_at"):
+                    st.caption(f"마지막 수집 {ss.kp_collected_at} (한국시간) — 수집 시각의 최신 공개값이며 "
+                               "실시간 가격을 보장하지 않습니다.")
+
+                st.markdown("### 주가 · 환율")
+                for key, label in labels.items():
+                    c1, c2, c3 = st.columns([3, 3, 3])
+                    c1.text_input(label + " 가격", key=f"kp_{key}_price")
+                    c2.text_input("등락 (숫자만)", key=f"kp_{key}_change")
+                    c3.radio("방향", DIR_KEYS, key=f"kp_{key}_dir", horizontal=True,
+                             format_func=lambda k: DIR_LABELS[k])
+                    if status.get(key):
+                        st.warning(f"{label}: 자동 수집 실패 — 직접 입력해 주세요. ({status[key]})")
+
+                st.markdown("### 코스피 · 코스닥 (이미지로 그려서 한글에 넣습니다)")
+                for key, label in (("kospi", "코스피"), ("kosdaq", "코스닥")):
+                    c1, c2, c3, c4 = st.columns([3, 2, 2, 3])
+                    c1.text_input(label + " 지수", key=f"kp_{key}_price")
+                    c2.text_input("등락", key=f"kp_{key}_change")
+                    c3.text_input("등락률(%)", key=f"kp_{key}_ratio")
+                    c4.radio("방향 ", DIR_KEYS, key=f"kp_{key}_dir", horizontal=True,
+                             format_func=lambda k: DIR_LABELS[k])
+                    if status.get(key):
+                        st.warning(f"{label}: 자동 수집 실패 — 직접 입력해 주세요. ({status[key]})")
+
+                st.markdown("### SMP · 유가")
+                c1, c2 = st.columns(2)
+                c1.text_input("SMP 육지 가중평균 (원/kWh)", key="kp_smp_price")
+                c2.text_input("두바이유 선물 (USD/bbl)", key="kp_dubai_price")
+                for key, label in (("smp", "SMP"), ("dubai", "두바이유")):
+                    if status.get(key):
+                        st.warning(f"{label}: 자동 수집 실패 — 직접 입력해 주세요. ({status[key]})")
+                    elif ss.get(f"kp_{key}_date"):
+                        st.caption(f"{label} 자료일: {ss[f'kp_{key}_date']}")
+
+                if st.button("② 한글 보고서 만들기", key="kp_generate", type="primary"):
+                    try:
+                        with st.spinner("한글 양식에 값을 채우는 중..."):
+                            kepco_generate()
+                    except Exception as exc:
+                        ss.kp_result = {"errors": [f"보고서 생성 중 오류: {exc}"]}
+
+            result = ss.get("kp_result")
+            if result:
+                with st.container(key="kepco_result"):
+                    if result.get("errors"):
+                        for msg in result["errors"]:
+                            st.error(msg)
+                    else:
+                        st.success("한글 보고서를 만들었습니다. 아래 미리보기를 확인하고 내려받으세요.")
+                        st.download_button(
+                            label="📥 한글 파일(.hwp) 다운로드",
+                            data=result["hwp"],
+                            file_name=result["name"],
+                            mime="application/x-hwp",
+                            key="download_kepco_hwp",
+                            type="primary",
+                        )
+                        st.markdown(result["preview"], unsafe_allow_html=True)
+                        with st.expander("한글 파일 안의 글자 전체 보기"):
+                            st.text("\n".join(result["texts"]))
+
+            with st.expander("💻 PC용 원본 프로그램 (참고)"):
+                if KEPCO_ZIP_PATH.is_file():
+                    st.download_button(
+                        label="📥 KepcoReport_v6.zip 다운로드",
+                        data=KEPCO_ZIP_PATH.read_bytes(),
+                        file_name="KepcoReport_v6.zip",
+                        mime="application/zip",
+                        key="download_kepco_zip",
+                    )
+                    guide_text = read_kepco_guide()
+                    if guide_text:
+                        st.text(guide_text)
+                else:
+                    st.warning("KepcoReport_v6.zip 파일을 찾을 수 없습니다.")
+
+        # ---------- 3. 청송군청 ----------
         elif current_sub == "cheongsong":
             st.markdown(
                 """
@@ -983,6 +1271,8 @@ elif st.session_state.page == "efficiency":
                 """,
                 unsafe_allow_html=True,
             )
+
+        # ---------- 4. 고성군청 ----------
         elif current_sub == "goseong":
             st.markdown(
                 """
@@ -1052,7 +1342,7 @@ elif st.session_state.page == "summary":
                         excel_file = pd.ExcelFile(uploaded_macro_file)
                         sheet_names = excel_file.sheet_names
                         df_mss = pd.read_excel(uploaded_macro_file, sheet_name=sheet_names[0])
-                        
+
                         st.success(f"데이터 로드 성공! (총 {len(df_mss)}행 감지)")
 
                         with st.expander("업로드된 데이터 미리보기"):
@@ -1060,11 +1350,11 @@ elif st.session_state.page == "summary":
 
                         if st.button("🚀 요청 양식으로 TXT 변환", key="run_mss_python", type="primary"):
                             with st.spinner("요청하신 양식에 맞춰 변환 중..."):
-                                
+
                                 cleaned_df = df_mss.dropna(how="all").fillna("")
-                                
+
                                 txt_lines = []
-                                txt_lines.append("< '26. 11. 9(월), 조간 주요 보도 >\n\n")
+                                txt_lines.append(f"< {today_title()}, 조간 주요 보도 >\n\n")
                                 txt_lines.append("■ 우리부 관련\n\n")
 
                                 for idx, row in cleaned_df.iterrows():
@@ -1073,7 +1363,7 @@ elif st.session_state.page == "summary":
                                         press = row_vals[0]
                                         title = row_vals[1]
                                         link = row_vals[2] if len(row_vals) > 2 else ""
-                                        
+
                                         txt_lines.append(f"ㅇ {press}, {title}\n")
                                         if link:
                                             txt_lines.append(f"{link}\n\n")
