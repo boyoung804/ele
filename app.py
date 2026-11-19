@@ -72,6 +72,72 @@ def today_title():
     return f"'{now:%y}. {now.month}. {now.day}({WEEKDAYS[now.weekday()]})"
 
 
+def build_mcst_summary(df):
+    """문체부 언론보도요약 매크로(엑셀 VBA '언론보도요약')와 같은 규칙으로 텍스트를 만듭니다.
+    입력 열 순서: A 기사제목, B 매체명, C 지면, D 원문URL, E 네이버URL (1행은 제목줄)
+    - 매체명이 비어 있는 줄은 분류 제목(<문체부 관련>, *문화예술 ...)
+    - 같은 기사(네이버URL, 없으면 원문URL)가 여러 번 나오면 지면을 합쳐 한 번만 쓰고, 나머지는 맨 아래 '중복 기사 모음'에 따로 모읍니다."""
+    now = datetime.now(KST)
+    rows = []
+    for _, r in df.iloc[:, :5].iterrows():
+        vals = ["" if (v is None or str(v).lower() == "nan") else str(v).strip() for v in r.tolist()]
+        vals += [""] * (5 - len(vals))
+        rows.append(vals)  # 제목, 매체, 지면, 원문URL, 네이버URL
+
+    def key_of(row):
+        return row[4] if row[4] else row[3]
+
+    # 1단계: 중복 체크 + 지면 합치기
+    page_by_key, first_idx, dup_idx = {}, set(), []
+    for i, row in enumerate(rows):
+        title, media, page = row[0], row[1], row[2]
+        k = key_of(row)
+        if title and media and k:
+            if k not in page_by_key:
+                page_by_key[k] = page
+                first_idx.add(i)
+            else:
+                existing = page_by_key[k]
+                if page:
+                    if existing == "":
+                        existing = page
+                    elif page not in existing:
+                        existing = existing + ", " + page
+                    page_by_key[k] = existing
+                dup_idx.append(i)
+
+    def article_lines(title, media, page, url):
+        head = f"■ {title} ({media}, {page})" if page else f"■ {title} ({media})"
+        out = [head]
+        if url:
+            out.append(url)
+        out.append("")
+        return out
+
+    # 2단계: 본문
+    lines = [f"{now:%m.%d}({WEEKDAYS[now.weekday()]}) 조간 언론보도 요약입니다", ""]
+    for i, row in enumerate(rows):
+        title, media, page = row[0], row[1], row[2]
+        if not title:
+            continue
+        k = key_of(row)
+        if not media:
+            lines += [title, ""]
+        elif i in first_idx or not k:
+            if k:
+                page = page_by_key[k]
+            lines += article_lines(title, media, page, k)
+
+    # 3단계: 중복 기사 모음
+    if dup_idx:
+        lines += ["", "", "중복 기사 모음", ""]
+        for i in dup_idx:
+            row = rows[i]
+            lines += article_lines(row[0], row[1], row[2], key_of(row))
+
+    return "\n".join(lines).rstrip("\n") + "\n"
+
+
 # ==================================================
 # 2. 화면 및 서브탭 이동
 # ==================================================
@@ -593,7 +659,8 @@ footer {{
 }}
 
 /* 중기부 조간 요약: TXT 다운로드 버튼 (파란색 둥근 버튼) */
-.st-key-download_mss_txt button {{
+.st-key-download_mss_txt button,
+.st-key-download_mcst_txt button {{
     background: #0f4fc0 !important;
     color: #ffffff !important;
     border: 1px solid #9bb8ee !important;
@@ -601,16 +668,19 @@ footer {{
     font-weight: 700 !important;
     padding: 8px 18px !important;
 }}
-.st-key-download_mss_txt button:hover {{
+.st-key-download_mss_txt button:hover,
+.st-key-download_mcst_txt button:hover {{
     background: #1a63e0 !important;
     color: #ffffff !important;
 }}
-.st-key-download_mss_txt button p {{
+.st-key-download_mss_txt button p,
+.st-key-download_mcst_txt button p {{
     color: #ffffff !important;
 }}
 
 /* 중기부 조간 요약 미리보기: 글자색 검정 */
-.st-key-mss_preview textarea {{
+.st-key-mss_preview textarea,
+.st-key-mcst_preview textarea {{
     color: #000000 !important;
     -webkit-text-fill-color: #000000 !important;
 }}
@@ -1424,8 +1494,36 @@ elif st.session_state.page == "summary":
                 """
                 <div class="sub-page-container">
                     <h2>🏛️ 2. 문체부 조간 요약</h2>
-                    <p>문화체육관광부 관련 조간 뉴스 및 주요 동향 요약 공간입니다.</p>
+                    <p>기사 목록 엑셀을 올리면 문체부 언론보도 요약 텍스트로 만들어 드립니다. (엑셀 매크로 '언론보도요약'과 같은 규칙)</p>
                 </div>
                 """,
                 unsafe_allow_html=True,
             )
+
+            with st.container():
+                st.markdown("### 📂 기사 목록 엑셀 업로드")
+                st.caption("열 순서: 기사제목 / 매체명 / 지면 / 원문URL / 네이버URL (1행은 제목줄). '기사 목록' 시트가 있으면 그 시트를, 없으면 첫 번째 시트를 사용합니다.")
+                uploaded_mcst_file = st.file_uploader(
+                    "문체부 기사 목록 파일 (.xlsx, .xlsm, .xls)",
+                    type=["xlsx", "xlsm", "xls"],
+                    key="mcst_uploader"
+                )
+
+                if uploaded_mcst_file is not None:
+                    try:
+                        excel_mcst = pd.ExcelFile(uploaded_mcst_file)
+                        sheet_pick = "기사 목록" if "기사 목록" in excel_mcst.sheet_names else excel_mcst.sheet_names[0]
+                        df_mcst = pd.read_excel(excel_mcst, sheet_name=sheet_pick, header=None, dtype=str).iloc[1:]
+                        st.success(f"데이터 로드 성공! ('{sheet_pick}' 시트, 총 {len(df_mcst)}행 감지)")
+
+                        mcst_text = build_mcst_summary(df_mcst)
+                        st.text_area("문체부 언론보도 요약 미리보기", mcst_text, height=450, key="mcst_preview")
+                        st.download_button(
+                            label="TXT 다운로드",
+                            data=mcst_text.encode("utf-8-sig"),
+                            file_name=f"문체부_조간요약_{datetime.now(KST):%Y%m%d}.txt",
+                            mime="text/plain",
+                            key="download_mcst_txt"
+                        )
+                    except Exception as exc:
+                        st.error(f"데이터를 처리하는 도중 오류가 발생했습니다: {exc}")
