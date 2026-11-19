@@ -592,6 +592,29 @@ footer {{
     font-weight: 600 !important;
 }}
 
+/* 중기부 조간 요약: TXT 다운로드 버튼 (파란색 둥근 버튼) */
+.st-key-download_mss_txt button {{
+    background: #0f4fc0 !important;
+    color: #ffffff !important;
+    border: 1px solid #9bb8ee !important;
+    border-radius: 10px !important;
+    font-weight: 700 !important;
+    padding: 8px 18px !important;
+}}
+.st-key-download_mss_txt button:hover {{
+    background: #1a63e0 !important;
+    color: #ffffff !important;
+}}
+.st-key-download_mss_txt button p {{
+    color: #ffffff !important;
+}}
+
+/* 중기부 조간 요약 미리보기: 글자색 검정 */
+.st-key-mss_preview textarea {{
+    color: #000000 !important;
+    -webkit-text-fill-color: #000000 !important;
+}}
+
 .st-key-editor_home button,
 .st-key-eff_home button,
 .st-key-sum_home button {{
@@ -1386,7 +1409,7 @@ elif st.session_state.page == "summary":
                             st.text_area("변환된 텍스트 미리보기", text_content, height=350, key="mss_preview")
 
                             st.download_button(
-                                label="📥 양식 맞춤 텍스트 파일 다운로드 (.txt)",
+                                label="TXT 다운로드",
                                 data=text_content.encode("utf-8-sig"),
                                 file_name="중기부_조간요약_양식적용.txt",
                                 mime="text/plain",
