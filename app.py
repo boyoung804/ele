@@ -1351,26 +1351,34 @@ elif st.session_state.page == "summary":
                         if st.button("🚀 요청 양식으로 TXT 변환", key="run_mss_python", type="primary"):
                             with st.spinner("요청하신 양식에 맞춰 변환 중..."):
 
+                                # 실제 엑셀 열 이름 기준으로 기사와 URL을 매칭합니다.
                                 cleaned_df = df_mss.dropna(how="all").fillna("")
+                                cleaned_df.columns = [str(c).strip() for c in cleaned_df.columns]
+                                required = ["기사 제목", "매체명"]
+                                missing = [c for c in required if c not in cleaned_df.columns]
+                                if missing:
+                                    raise ValueError(f"필수 열이 없습니다: {', '.join(missing)}")
 
-                                txt_lines = []
-                                txt_lines.append(f"< {today_title()}, 조간 주요 보도 >\n\n")
-                                txt_lines.append("■ 우리부 관련\n\n")
+                                txt_lines = [f"< {today_title()}, 조간 주요 보도 >\n\n"]
+                                for _, row in cleaned_df.iterrows():
+                                    title = str(row.get("기사 제목", "")).strip()
+                                    press = str(row.get("매체명", "")).strip()
+                                    if not title:
+                                        continue
+                                    if title.startswith("■"):
+                                        txt_lines.append(f"{title}\n\n")
+                                        continue
+                                    if not press:
+                                        continue
 
-                                for idx, row in cleaned_df.iterrows():
-                                    row_vals = [str(val).strip() for val in row.values if str(val).strip() != ""]
-                                    if len(row_vals) >= 2:
-                                        press = row_vals[0]
-                                        title = row_vals[1]
-                                        link = row_vals[2] if len(row_vals) > 2 else ""
-
-                                        txt_lines.append(f"ㅇ {press}, {title}\n")
-                                        if link:
-                                            txt_lines.append(f"{link}\n\n")
-                                        else:
-                                            txt_lines.append("\n")
-                                    elif len(row_vals) == 1:
-                                        txt_lines.append(f"ㅇ {row_vals[0]}\n\n")
+                                    naver_url = str(row.get("Naver수집URL", "")).strip()
+                                    original_url = str(row.get("기사URL", "")).strip()
+                                    url = next((u for u in (naver_url, original_url)
+                                                if u.startswith(("https://", "http://"))), "")
+                                    txt_lines.append(f"ㅇ {press}, {title}\n")
+                                    if url:
+                                        txt_lines.append(f"{url}\n")
+                                    txt_lines.append("\n")
 
                                 text_content = "".join(txt_lines)
 
