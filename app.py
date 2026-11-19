@@ -76,7 +76,8 @@ def build_mcst_summary(df):
     """문체부 언론보도요약 매크로(엑셀 VBA '언론보도요약')와 같은 규칙으로 텍스트를 만듭니다.
     입력 열 순서: A 기사제목, B 매체명, C 지면, D 원문URL, E 네이버URL (1행은 제목줄)
     - 매체명이 비어 있는 줄은 분류 제목(<문체부 관련>, *문화예술 ...)
-    - 같은 기사(네이버URL, 없으면 원문URL)가 여러 번 나오면 지면을 합쳐 한 번만 쓰고, 나머지는 맨 아래 '중복 기사 모음'에 따로 모읍니다."""
+    - 같은 기사(네이버URL, 없으면 원문URL)가 여러 번 나오면 지면을 합쳐 한 번만 씁니다. (중복 기사 모음은 만들지 않음)"""
+    FIXED_TOP = "<문체부 관련>"  # 항상 첫 대제목으로 고정
     now = datetime.now(KST)
     rows = []
     for _, r in df.iloc[:, :5].iterrows():
@@ -115,25 +116,22 @@ def build_mcst_summary(df):
         return out
 
     # 2단계: 본문
-    lines = [f"{now:%m.%d}({WEEKDAYS[now.weekday()]}) 조간 언론보도 요약입니다", ""]
+    lines = [f"{now:%m.%d}({WEEKDAYS[now.weekday()]}) 조간 언론보도 요약입니다", "", FIXED_TOP, ""]
     for i, row in enumerate(rows):
         title, media, page = row[0], row[1], row[2]
         if not title:
             continue
+        if not media and title.replace(" ", "") == FIXED_TOP.replace(" ", ""):
+            continue  # 맨 위 고정 대제목과 같은 줄은 중복이므로 건너뜀
         k = key_of(row)
         if not media:
+            if title.replace(" ", "").startswith("<국정") and lines and lines[-1] == "":
+                lines.append("")  # <국정전반> 위에는 공백 두 줄
             lines += [title, ""]
         elif i in first_idx or not k:
             if k:
                 page = page_by_key[k]
             lines += article_lines(title, media, page, k)
-
-    # 3단계: 중복 기사 모음
-    if dup_idx:
-        lines += ["", "", "중복 기사 모음", ""]
-        for i in dup_idx:
-            row = rows[i]
-            lines += article_lines(row[0], row[1], row[2], key_of(row))
 
     return "\n".join(lines).rstrip("\n") + "\n"
 
@@ -683,6 +681,9 @@ footer {{
 .st-key-mcst_preview textarea {{
     color: #000000 !important;
     -webkit-text-fill-color: #000000 !important;
+    font-size: 18px !important;
+    line-height: 1.7 !important;
+    font-weight: 400 !important;
 }}
 
 .st-key-editor_home button,
